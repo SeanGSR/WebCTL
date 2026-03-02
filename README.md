@@ -1,4 +1,4 @@
-# Web Setup Script
+# webctl
 
 A bash script to manage Nginx web sites on Debian/Ubuntu and Arch Linux. Handles static sites, WordPress, PHP applications, and reverse proxies with SFTP access, SSL, backups, and more.
 
@@ -23,17 +23,17 @@ A bash script to manage Nginx web sites on Debian/Ubuntu and Arch Linux. Handles
 
 ```bash
 # Download
-curl -O https://raw.githubusercontent.com/SeanGSR/setup-site/main/setup-site.sh
-chmod +x setup-site.sh
+curl -O https://raw.githubusercontent.com/SeanGSR/webctl/main/webctl.sh
+chmod +x webctl.sh
 
 # Run
-sudo bash setup-site.sh
+sudo bash webctl.sh
 ```
 
 ## Usage
 
 ```
-sudo bash setup-site.sh
+sudo bash webctl.sh
 ```
 
 ### Main Menu
