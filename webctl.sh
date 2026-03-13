@@ -313,15 +313,38 @@ setup_nginx_dirs() {
         log "Created ${NGINX_ENABLED}"
     fi
 
-    # Ensure nginx.conf includes sites-enabled
+    # Ensure nginx.conf includes sites-enabled and doesn't have a conflicting default server
     if [[ -f /etc/nginx/nginx.conf ]]; then
+
+        # Comment out the default server block that ships with Arch/stock nginx
+        # This block serves the "Welcome to nginx!" page and conflicts with site configs
+        if grep -qP '^\s*server\s*\{' /etc/nginx/nginx.conf; then
+            if grep -A5 'server {' /etc/nginx/nginx.conf | grep -q '/usr/share/nginx/html\|listen.*80'; then
+                info "Commenting out default server block in nginx.conf..."
+                # Use awk to comment out the first uncommented server { ... } block
+                awk '
+                    /^[^#]*server\s*\{/ && !found {
+                        found=1; depth=0
+                    }
+                    found && !done {
+                        if (/\{/) depth++
+                        if (/\}/) depth--
+                        $0 = "#webctl " $0
+                        if (depth == 0) done=1
+                    }
+                    { print }
+                ' /etc/nginx/nginx.conf > /etc/nginx/nginx.conf.tmp \
+                    && mv /etc/nginx/nginx.conf.tmp /etc/nginx/nginx.conf
+                log "Commented out default server block in nginx.conf"
+            fi
+        fi
+
+        # Add include directive for sites-enabled inside the http block
         if ! grep -q "include.*sites-enabled" /etc/nginx/nginx.conf; then
-            # Add include directive inside the http block
             if grep -q "^http {" /etc/nginx/nginx.conf; then
                 sed -i '/^http {/a\    include /etc/nginx/sites-enabled/*;' /etc/nginx/nginx.conf
                 log "Added sites-enabled include to nginx.conf"
             else
-                # Try to add before the closing brace of http block
                 sed -i '/^}/i\    include /etc/nginx/sites-enabled/*;' /etc/nginx/nginx.conf
                 log "Added sites-enabled include to nginx.conf"
             fi
@@ -361,16 +384,43 @@ pkg_install() {
     esac
 }
 
+ask_local_or_public() {
+    IS_LOCAL=false
+    echo -e "    ${BOLD}${GREEN}1${NC} | ${BOLD}Public${NC}  ${DIM}-- real domain with DNS (e.g. example.com)${NC}"
+    echo -e "    ${BOLD}${CYAN}2${NC} | ${BOLD}Local${NC}   ${DIM}-- local dev domain via /etc/hosts (e.g. myapp.local)${NC}"
+    echo
+    echo -ne "  ${CYAN}${ARROW}${NC} Public or local? ${DIM}[1-2]${NC}: "
+    read -r scope_choice
+    case "$scope_choice" in
+        2) IS_LOCAL=true ;;
+        1) IS_LOCAL=false ;;
+        *) warn "Defaulting to public." ;;
+    esac
+}
+
 check_dependencies() {
-    local base_deps=(nginx certbot curl wget unzip openssl)
+    # Build dependency list based on site type AND local/public mode
+    local base_deps=(nginx curl unzip openssl)
     local need_php=false
     local need_db=false
+    local need_ssl=false
+
+    # wget is useful but not strictly required for local static/proxy
+    if [[ "$SITE_TYPE" == "wordpress" ]]; then
+        base_deps+=(wget)  # needed to download WordPress
+    fi
 
     case "$SITE_TYPE" in
         wordpress)  need_php=true; need_db=true ;;
         php)        need_php=true ;;
         static|proxy) ;;
     esac
+
+    # Only require SSL tools for public sites
+    if ! $IS_LOCAL; then
+        need_ssl=true
+        base_deps+=(certbot)
+    fi
 
     header "Checking Dependencies"
     local missing=()
@@ -384,14 +434,20 @@ check_dependencies() {
         fi
     done
 
-    # Check certbot nginx plugin
-    if ! certbot plugins 2>/dev/null | grep -q "nginx"; then
-        local certbot_nginx_pkg="python3-certbot-nginx"
-        [[ "$DISTRO_FAMILY" == "arch" ]] && certbot_nginx_pkg="certbot-nginx"
-        missing+=("$certbot_nginx_pkg")
-        warn "certbot nginx plugin — ${RED}not found${NC}"
+    # Check certbot nginx plugin (only for public sites)
+    if $need_ssl; then
+        if command -v certbot &>/dev/null; then
+            if ! certbot plugins 2>/dev/null | grep -q "nginx"; then
+                local certbot_nginx_pkg="python3-certbot-nginx"
+                [[ "$DISTRO_FAMILY" == "arch" ]] && certbot_nginx_pkg="certbot-nginx"
+                missing+=("$certbot_nginx_pkg")
+                warn "certbot nginx plugin — ${RED}not found${NC}"
+            else
+                log "certbot nginx plugin"
+            fi
+        fi
     else
-        log "certbot nginx plugin"
+        info "SSL tools not needed for local site — skipping certbot"
     fi
 
     if $need_php; then
@@ -442,7 +498,6 @@ check_dependencies() {
                                 for ext in php-gd php-intl php-sodium php-imagick imagemagick; do
                                     pkg_install "$ext" &>/dev/null || true
                                 done
-                                # Arch PHP extensions are mostly compiled-in; enable in php.ini
                                 local php_ini="/etc/php/php.ini"
                                 if [[ -f "$php_ini" ]]; then
                                     for ext in mysqli curl gd mbstring xml zip intl bcmath sodium imagick; do
@@ -475,7 +530,6 @@ check_dependencies() {
                         if [[ "$DISTRO_FAMILY" == "arch" ]]; then
                             pkg_install mariadb &
                             spinner $! "Installing MariaDB..."
-                            # Arch needs manual database initialization
                             if [[ ! -d /var/lib/mysql/mysql ]]; then
                                 info "Initializing MariaDB data directory..."
                                 mariadb-install-db --user=mysql --basedir=/usr --datadir=/var/lib/mysql 2>&1 | tee -a "$LOG_FILE"
@@ -516,6 +570,155 @@ show_banner() {
 }
 
 # ── Main Menu ────────────────────────────────────────────────
+manage_services() {
+    header "Service Manager"
+
+    # Build list of services to check based on what's installed
+    local -a services=()
+    local -a labels=()
+
+    # Nginx — always relevant
+    services+=("nginx")
+    labels+=("Nginx")
+
+    # PHP-FPM — only if PHP is installed
+    if command -v php &>/dev/null; then
+        services+=("${PHP_FPM_SERVICE}")
+        labels+=("PHP-FPM (${PHP_FPM_SERVICE})")
+    fi
+
+    # MariaDB/MySQL — only if installed
+    if command -v mysql &>/dev/null; then
+        if systemctl list-unit-files mariadb.service &>/dev/null 2>&1; then
+            services+=("mariadb")
+            labels+=("MariaDB")
+        elif systemctl list-unit-files mysql.service &>/dev/null 2>&1; then
+            services+=("mysql")
+            labels+=("MySQL")
+        fi
+    fi
+
+    # SSH/SSHD — check for SFTP support
+    if systemctl list-unit-files sshd.service &>/dev/null 2>&1; then
+        services+=("sshd")
+        labels+=("SSH (sshd)")
+    elif systemctl list-unit-files ssh.service &>/dev/null 2>&1; then
+        services+=("ssh")
+        labels+=("SSH (ssh)")
+    fi
+
+    # Check each service
+    local -a stopped=()
+    local -a stopped_labels=()
+    local -a not_enabled=()
+    local -a not_enabled_labels=()
+    local all_ok=true
+
+    for i in "${!services[@]}"; do
+        local svc="${services[$i]}"
+        local label="${labels[$i]}"
+        local status_icon=""
+        local enabled_icon=""
+        local status_text=""
+
+        # Check if running
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            status_icon="${GREEN}${CHECK}${NC}"
+            status_text="${GREEN}running${NC}"
+        else
+            status_icon="${RED}${CROSS}${NC}"
+            status_text="${RED}stopped${NC}"
+            stopped+=("$svc")
+            stopped_labels+=("$label")
+            all_ok=false
+        fi
+
+        # Check if enabled at boot
+        if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+            enabled_icon="${GREEN}boot${NC}"
+        else
+            enabled_icon="${YELLOW}manual${NC}"
+            not_enabled+=("$svc")
+            not_enabled_labels+=("$label")
+            all_ok=false
+        fi
+
+        echo -e "    ${status_icon} ${BOLD}${label}${NC}"
+        echo -e "       Status: ${status_text}  |  Startup: ${enabled_icon}"
+        echo
+    done
+
+    separator
+
+    if $all_ok; then
+        echo
+        log "${GREEN}All services are running and enabled at boot${NC}"
+        echo
+        return
+    fi
+
+    # Offer to start stopped services
+    if [[ ${#stopped[@]} -gt 0 ]]; then
+        echo
+        warn "${#stopped[@]} service(s) not running: ${BOLD}${stopped_labels[*]}${NC}"
+        if confirm "Start all stopped services now?"; then
+            for i in "${!stopped[@]}"; do
+                local svc="${stopped[$i]}"
+                local label="${stopped_labels[$i]}"
+                info "Starting ${label}..."
+                if systemctl start "$svc" 2>&1 | tee -a "$LOG_FILE"; then
+                    log "${label} started"
+                else
+                    warn "Failed to start ${label}. Check: journalctl -u ${svc}"
+                fi
+            done
+        fi
+    fi
+
+    # Offer to enable services at boot
+    if [[ ${#not_enabled[@]} -gt 0 ]]; then
+        echo
+        warn "${#not_enabled[@]} service(s) not enabled at boot: ${BOLD}${not_enabled_labels[*]}${NC}"
+        if confirm "Enable all services to start automatically on boot?"; then
+            for i in "${!not_enabled[@]}"; do
+                local svc="${not_enabled[$i]}"
+                local label="${not_enabled_labels[$i]}"
+                if systemctl enable "$svc" 2>&1 | tee -a "$LOG_FILE"; then
+                    log "${label} enabled at boot"
+                else
+                    warn "Failed to enable ${label}."
+                fi
+            done
+        fi
+    fi
+
+    # Final status recheck
+    echo
+    separator
+    echo -e "  ${BOLD}${WHITE}Updated Status${NC}"
+    echo
+    for i in "${!services[@]}"; do
+        local svc="${services[$i]}"
+        local label="${labels[$i]}"
+        local running="false"
+        local enabled="false"
+
+        systemctl is-active --quiet "$svc" 2>/dev/null && running="true"
+        systemctl is-enabled --quiet "$svc" 2>/dev/null && enabled="true"
+
+        local icon="${RED}${CROSS}${NC}"
+        [[ "$running" == "true" ]] && icon="${GREEN}${CHECK}${NC}"
+
+        local boot="${YELLOW}manual${NC}"
+        [[ "$enabled" == "true" ]] && boot="${GREEN}boot${NC}"
+
+        echo -e "    ${icon} ${label}  ${DIM}|${NC}  ${boot}"
+    done
+    echo
+    separator
+    echo
+}
+
 main_menu() {
     show_banner
     separator
@@ -529,10 +732,11 @@ main_menu() {
     echo -e "    ${BOLD}${MAGENTA}5${NC} | Setup SSL auto-renewal"
     echo -e "    ${BOLD}${WHITE}6${NC} | Backup Manager"
     echo -e "    ${BOLD}${RED}7${NC} | Delete a site"
-    echo -e "    ${DIM}8${NC} | Exit"
+    echo -e "    ${BOLD}${CYAN}8${NC} | Service Manager"
+    echo -e "    ${DIM}9${NC} | Exit"
     echo
     separator
-    echo -ne "  ${CYAN}${ARROW}${NC} Choose an option ${DIM}[1-8]${NC}: "
+    echo -ne "  ${CYAN}${ARROW}${NC} Choose an option ${DIM}[1-9]${NC}: "
     read -r choice
 
     case "$choice" in
@@ -543,7 +747,8 @@ main_menu() {
         5) setup_ssl_auto_renewal; echo; main_menu ;;
         6) manage_backups; echo; main_menu ;;
         7) delete_site; echo; main_menu ;;
-        8) echo -e "\n  ${DIM}Goodbye.${NC}\n"; exit 0 ;;
+        8) manage_services; echo; main_menu ;;
+        9) echo -e "\n  ${DIM}Goodbye.${NC}\n"; exit 0 ;;
         *) warn "Invalid option."; main_menu ;;
     esac
 }
@@ -575,18 +780,7 @@ site_type_menu() {
 gather_info() {
     header "Site Configuration"
 
-    # Local or public?
-    IS_LOCAL=false
-    echo -e "    ${BOLD}${GREEN}1${NC} | ${BOLD}Public${NC}  ${DIM}-- real domain with DNS (e.g. example.com)${NC}"
-    echo -e "    ${BOLD}${CYAN}2${NC} | ${BOLD}Local${NC}   ${DIM}-- local dev domain via /etc/hosts (e.g. myapp.local)${NC}"
-    echo
-    echo -ne "  ${CYAN}${ARROW}${NC} Public or local? ${DIM}[1-2]${NC}: "
-    read -r scope_choice
-    case "$scope_choice" in
-        2) IS_LOCAL=true ;;
-        1) IS_LOCAL=false ;;
-        *) warn "Defaulting to public." ;;
-    esac
+    # NOTE: IS_LOCAL is already set by ask_local_or_public() called earlier
 
     # Domain
     if $IS_LOCAL; then
@@ -880,7 +1074,7 @@ php_admin_value[open_basedir] = ${SITE_DIR}/public:/tmp
 php_admin_value[disable_functions] = passthru,shell_exec,system
 EOF
 
-    systemctl restart "${PHP_FPM_SERVICE}" || error "Failed to restart PHP-FPM. Check the pool config."
+    systemctl enable --now "${PHP_FPM_SERVICE}" || error "Failed to start PHP-FPM. Check the pool config."
     PHP_SOCK="$SOCK"
     log "PHP-FPM pool created: ${DIM}${POOL_FILE}${NC}"
 }
@@ -1427,6 +1621,7 @@ EOF
 # ── Create Site Orchestrator ─────────────────────────────────
 create_site() {
     site_type_menu
+    ask_local_or_public
     check_dependencies
     gather_info
     create_directories
