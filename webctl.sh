@@ -1074,7 +1074,15 @@ php_admin_value[open_basedir] = ${SITE_DIR}/public:/tmp
 php_admin_value[disable_functions] = passthru,shell_exec,system
 EOF
 
-    systemctl enable --now "${PHP_FPM_SERVICE}" || error "Failed to start PHP-FPM. Check the pool config."
+    # Enable PHP-FPM at boot, then reload/restart to pick up the new pool
+    systemctl enable "${PHP_FPM_SERVICE}" 2>/dev/null || true
+    if systemctl is-active --quiet "${PHP_FPM_SERVICE}"; then
+        systemctl restart "${PHP_FPM_SERVICE}" || error "Failed to restart PHP-FPM. Check the pool config."
+        log "PHP-FPM restarted to load new pool"
+    else
+        systemctl start "${PHP_FPM_SERVICE}" || error "Failed to start PHP-FPM. Check the pool config."
+        log "PHP-FPM started"
+    fi
     PHP_SOCK="$SOCK"
     log "PHP-FPM pool created: ${DIM}${POOL_FILE}${NC}"
 }
